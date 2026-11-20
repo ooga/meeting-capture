@@ -1616,10 +1616,11 @@ protocol MeetingApp {
     /// detection uses should keep waking until both hold.
     func treeReadiness(_ app: AXUIElement) -> TreeReadiness
 
-    /// Title of the window this app shows a screen share in, matched as a
-    /// substring, for --slides. nil: shares appear inside the meeting window
-    /// alongside video, which slide capture can't single out yet.
-    var shareWindowTitle: String? { get }
+    /// Titles of the window this app shows a screen share in, one per UI
+    /// language, each matched as a substring, for --slides. Empty: shares
+    /// appear inside the meeting window alongside video, which slide capture
+    /// can't single out yet.
+    var shareWindowTitles: [String] { get }
 
     /// How the slide helper finds the share, for --slides: its window
     /// selection arguments. nil: slides aren't supported for this app.
@@ -1632,8 +1633,10 @@ protocol MeetingApp {
 }
 
 extension MeetingApp {
-    var shareWindowTitle: String? { nil }
-    var slideSelection: [String]? { shareWindowTitle.map { ["--title", $0] } }
+    var shareWindowTitles: [String] { [] }
+    var slideSelection: [String]? {
+        shareWindowTitles.isEmpty ? nil : shareWindowTitles.flatMap { ["--title", $0] }
+    }
     // Teams-style: an utterance is done when its element disappears.
     var finalizesWhenSuperseded: Bool { false }
     var idleFinalizeSeconds: TimeInterval? { nil }
@@ -1946,16 +1949,34 @@ func rosterCount(from candidates: [String]) -> Int? {
         }
     }
     for text in candidates {
-        if let range = text.range(of: "(\\d+) total", options: .regularExpression) {
-            let upTo = text.index(range.upperBound, offsetBy: -" total".count)
-            if let n = Int(text[range.lowerBound..<upTo]) { return n }
+        // "293 total" in English, "20 au total" in French.
+        if let range = text.range(of: "(\\d+) (au )?total", options: .regularExpression),
+           let digits = text[range].split(separator: " ").first, let n = Int(digits) {
+            return n
         }
     }
     return nil
 }
 
+/// The People panel splits its rows into sections, each under a title row
+/// whose DOM id is `roster-title-section-<n>`: "In this meeting" / « Dans
+/// cette réunion » (seen live as section 2), then people who were invited or
+/// added to the chat but are not in the call (« Autres invités », « Personnes
+/// ajoutées à la conversation », sections 3 and 4). Only the first is the room.
+/// Recognised by its text in the languages known here, or by that id.
+let rosterInMeetingPhrases = ["In this meeting", "Dans cette réunion"]
+let rosterInMeetingSectionID = "roster-title-section-2"
+
+func isInMeetingRosterSection(domID: String, texts: [String]) -> Bool {
+    if domID == rosterInMeetingSectionID { return true }
+    return texts.contains { text in rosterInMeetingPhrases.contains { text.hasPrefix($0) } }
+}
+
+/// Trailing state chips on a row's description, in English and French.
 private let rosterStateWords: Set<String> = ["Muted", "Unmuted", "Organizer",
-    "Speaking", "Sharing", "Presenting", "Pinned", "Spotlighted", "On hold"]
+    "Speaking", "Sharing", "Presenting", "Pinned", "Spotlighted", "On hold",
+    "Micro désactivé", "Micro activé", "Organisateur", "Organisatrice", "En réunion",
+    "Acceptée", "Accepté", "Absent(e)", "Absent du bureau", "Hors connexion", "Disponible"]
 
 /// A row's description is "<Name>[, <state>]…" — "Allen, Mary Catherine,
 /// Organizer, Muted". The trailing states are chips, not parts of the name;
@@ -1984,10 +2005,14 @@ func bareName(from description: String) -> String {
 ///
 /// What it really means is "the server has not sent these yet", and the only
 /// thing that helps is waiting at the bottom of the list.
-func isRosterExpander(_ text: String) -> Bool { text == "See more" }
+///
+/// The French labels are educated guesses: no French roster long enough to
+/// paginate has been seen yet.
+func isRosterExpander(_ text: String) -> Bool { ["See more", "Afficher plus", "Voir plus"].contains(text) }
+/// "+203 more" — or its translation: a leading "+<number>" and a word after.
 func rosterBacklog(_ text: String) -> Int? {
-    guard text.hasPrefix("+"), text.hasSuffix(" more") else { return nil }
-    return Int(text.dropFirst().dropLast(" more".count))
+    guard let range = text.range(of: "^\\+(\\d+) \\S", options: .regularExpression) else { return nil }
+    return Int(text[range].dropFirst().split(separator: " ")[0])
 }
 
 /// One person on the roster. `key` is the DOM id's tail after
@@ -1996,6 +2021,17 @@ func rosterBacklog(_ text: String) -> Int? {
 struct RosterPerson {
     let name: String
     let key: String
+    /// Whether the row sits in the "In this meeting" section: true or false
+    /// when its section title was read, nil when it was scrolled out of view.
+    var inMeeting: Bool? = nil
+}
+
+/// Keep only the people in the call. Rows whose section was never seen count
+/// only when nothing at all was classified (an unrecognised layout), so an
+/// unknown Teams falls back to listing everyone rather than no one.
+func peopleInMeeting(_ people: [RosterPerson]) -> [RosterPerson] {
+    guard people.contains(where: { $0.inMeeting != nil }) else { return people }
+    return people.filter { $0.inMeeting == true }
 }
 
 /// Who the People panel listed, and whether that is everyone.
@@ -2050,9 +2086,23 @@ func rosterPeople(in panel: AXUIElement) -> [RosterPerson] {
         }
         for child in axChildren(e) { scanAvatar(child, depth + 1, &name) }
     }
+    func hasMic(_ e: AXUIElement, _ depth: Int) -> Bool {
+        guard depth < 15 else { return false }
+        if axDomID(e).hasPrefix("roster-mic-button-") { return true }
+        return axChildren(e).contains { hasMic($0, depth + 1) }
+    }
+    // Section titles come before their rows in tree order. Rows above the
+    // first title in view belong to a section scrolled off the top; only
+    // people in the call show a microphone, so that decides for them.
+    var section: Bool?
     func scan(_ e: AXUIElement, _ depth: Int) {
         guard depth < 60 else { return }
         let domid = axDomID(e)
+        if domid.hasPrefix("roster-title-section") {
+            section = isInMeetingRosterSection(
+                domID: domid, texts: [axDescription(e), axString(e, kAXTitleAttribute)] + axStaticTexts(e))
+            return
+        }
         if domid.hasPrefix("calling-roster-item-") {
             let key = String(domid.dropFirst("calling-roster-item-".count))
             if !seen.contains(key) {
@@ -2060,7 +2110,8 @@ func rosterPeople(in panel: AXUIElement) -> [RosterPerson] {
                 var name = ""
                 scanAvatar(e, 0, &name)
                 if name.isEmpty { name = bareName(from: axDescription(e)) }
-                if !name.isEmpty { people.append(RosterPerson(name: name, key: key)) }
+                let inMeeting = section ?? (hasMic(e, 0) ? true : nil)
+                if !name.isEmpty { people.append(RosterPerson(name: name, key: key, inMeeting: inMeeting)) }
             }
             return // rows do not nest rows
         }
@@ -2076,8 +2127,17 @@ func axActionNames(_ element: AXUIElement) -> [String] {
     return names as? [String] ?? []
 }
 
+/// The People panel: described "Participants" in both English and French.
+/// In French the toolbar button that opens it is described "Participants"
+/// too (in English it says "People"), so buttons never count.
+func isRosterPanel(_ element: AXUIElement) -> Bool {
+    axDescription(element) == "Participants"
+        && axDomID(element) != "roster-button"
+        && axString(element, kAXRoleAttribute) != kAXButtonRole
+}
+
 func rosterPanel(in window: AXUIElement) -> AXUIElement? {
-    findElement(from: window, where: { axDescription($0) == "Participants" })
+    findElement(from: window, where: isRosterPanel)
 }
 
 /// The long roster's paginator is not a button. It is an AXStaticText reading
@@ -2099,10 +2159,19 @@ func rosterBacklog(in panel: AXUIElement) -> Int? {
 }
 
 func rosterCount(in panel: AXUIElement) -> Int? {
+    // Only the "In this meeting" title counts the room; the sections below it
+    // ("Others invited (2)") count people who are not there.
     if let title = findElement(from: panel, where: {
-        axDomID($0).hasPrefix("roster-title-section")
+        let id = axDomID($0)
+        return id.hasPrefix("roster-title-section")
+            && isInMeetingRosterSection(domID: id, texts: [axDescription($0)] + axStaticTexts($0))
     }), let count = rosterCount(from: [axDescription(title)] + axStaticTexts(title)) {
         return count
+    }
+    // A section title that is not the room's means the room's own title is
+    // scrolled out of view: no count, rather than another section's.
+    if findElement(from: panel, where: { axDomID($0).hasPrefix("roster-title-section") }) != nil {
+        return nil
     }
     // Newer Teams builds drop that id and put the total in a heading instead:
     // "In this meeting (284)".
@@ -2125,7 +2194,11 @@ func rosterCount(in panel: AXUIElement) -> Int? {
 /// window, and the next wheel would scroll it.
 func scrollRoster(_ panel: AXUIElement, direction: Int32,
                   in window: AXUIElement, pid: pid_t) -> CGPoint? {
-    let root = findElement(from: panel, where: { axDescription($0) == "Attendees" }) ?? panel
+    // The scrolling list: "Attendees" in English builds that label it, else the
+    // panel's outline (French labels it "Participants", like the panel).
+    let root = findElement(from: panel, where: { axDescription($0) == "Attendees" })
+        ?? findElement(from: panel, where: { axString($0, kAXRoleAttribute) == kAXOutlineRole })
+        ?? panel
     let (origin, size) = axFrame(root)
     let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height * 0.6)
     func blocked() -> Bool {
@@ -2176,7 +2249,7 @@ func fullestRosterPanel(in window: AXUIElement) -> AXUIElement? {
     var panels: [AXUIElement] = []
     func collect(_ element: AXUIElement, depth: Int) {
         guard depth < 80 else { return }
-        if axDescription(element) == "Participants" { panels.append(element); return }
+        if isRosterPanel(element) { panels.append(element); return }
         for child in axChildren(element) { collect(child, depth: depth + 1) }
     }
     collect(window, depth: 0)
@@ -2329,14 +2402,21 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
     @discardableResult
     func mergeViewport() -> Int {
         let before = seen.count
-        for person in rosterPeople(in: panel) where seen.insert(person.key).inserted {
-            people.append(person)
+        for person in rosterPeople(in: panel) {
+            if seen.insert(person.key).inserted {
+                people.append(person)
+            } else if person.inMeeting != nil,
+                      let index = people.firstIndex(where: { $0.key == person.key }),
+                      people[index].inMeeting == nil {
+                // Seen first with its section title out of view; now known.
+                people[index].inMeeting = person.inMeeting
+            }
         }
         return seen.count - before
     }
     mergeViewport()
 
-    if expected == nil || people.count < expected! {
+    if expected == nil || peopleInMeeting(people).count < expected! {
         // The paginator sits just below the last rendered row and is otherwise
         // clipped away. Grow to the bottom of this display to reveal it.
         let windowFrame = axFrame(window)
@@ -2365,7 +2445,7 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         var stale = 0
         var interrupted = false
         for _ in 0..<400 {
-            if let expected, seen.count >= expected { break }
+            if let expected, peopleInMeeting(people).count >= expected { break }
             if let deadline, Date() >= deadline { break }
             // The tree moves under us — expansion opens new panels and
             // virtualized roots swap on scroll — so never search a held
@@ -2418,6 +2498,7 @@ func captureTeamsRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
         }
     }
 
+    people = peopleInMeeting(people)
     people.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     guard !people.isEmpty else { return .failed("the People panel listed nobody") }
     return .captured(RosterSnapshot(people: people, expected: expected))
@@ -2452,8 +2533,9 @@ enum TeamsChatClasses {
 final class TeamsApp: MeetingApp {
     let id = "teams"
     let displayName = "Microsoft Teams"
-    // Teams opens a viewed share in a window of its own: "Shared content | <meeting>".
-    let shareWindowTitle: String? = "Shared content"
+    // Teams opens a viewed share in a window of its own: "Shared content | <meeting>",
+    // « Contenu partagé | <meeting> » in French.
+    let shareWindowTitles = ["Shared content", "Contenu partagé"]
     let processPattern = "Microsoft Teams.app/Contents/MacOS/MSTeams"
     let captionPressToggles = true
     // The People panel lists everyone, expandable page by page — with real
@@ -2730,10 +2812,12 @@ final class TeamsApp: MeetingApp {
         popOutShare(app, pid: pid, window: window)
     }
 
-    /// A popped-out share: its title starts with "Shared content".
+    /// A popped-out share: its title starts with "Shared content" (or its translation).
     private func shareWindow(_ app: AXUIElement) -> AXUIElement? {
-        guard let title = shareWindowTitle else { return nil }
-        return axWindows(app).first { axString($0, kAXTitleAttribute).contains(title) }
+        axWindows(app).first { window in
+            let title = axString(window, kAXTitleAttribute)
+            return shareWindowTitles.contains { title.contains($0) }
+        }
     }
 
     /// Press the share's "Pop out" with a real click (Teams' WebView ignores

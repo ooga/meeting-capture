@@ -68,7 +68,8 @@ struct Options {
     var pid: pid_t?
     var wait = false
     var app: String?
-    var title: String?
+    /// Window title substrings; a window matches if it contains any of them.
+    var titles: [String] = []
     var crop: [Double]?
     var meetStage = false
     var directory: String?
@@ -97,7 +98,8 @@ func usage(_ status: Int32 = 0) -> Never {
       --list               list capturable windows and exit
       --window ID          capture this window ID (from --list)
       --app TEXT           match app name or bundle ID (case-insensitive substring)
-      --title TEXT         match window title (case-insensitive substring)
+      --title TEXT         match window title (case-insensitive substring);
+                           repeat it to accept any of several titles
       --pid PID            only windows of this process
       --wait               no matching window is not an error: wait for one, and
                            wait again when it closes (how meeting-capture runs it)
@@ -173,7 +175,7 @@ func parseOptions() -> Options {
             options.pid = pid
         case "--wait": options.wait = true
         case "--app": options.app = value(arg)
-        case "--title": options.title = value(arg)
+        case "--title": options.titles.append(value(arg))
         case "--crop":
             let raw = value(arg)
             let parts = raw.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
@@ -284,11 +286,12 @@ func pickWindow(_ content: SCShareableContent, _ options: Options, bundle: Strin
             let name = window.owningApplication?.applicationName.lowercased() ?? ""
             let bundle = window.owningApplication?.bundleIdentifier.lowercased() ?? ""
             guard name.contains(app) || bundle.contains(app) else { return false }
-        } else if options.title == nil, options.pid == nil, !isMeetingWindow(window) {
+        } else if options.titles.isEmpty, options.pid == nil, !isMeetingWindow(window) {
             return false
         }
-        if let title = options.title?.lowercased() {
-            guard (window.title ?? "").lowercased().contains(title) else { return false }
+        if !options.titles.isEmpty {
+            let title = (window.title ?? "").lowercased()
+            guard options.titles.contains(where: { title.contains($0.lowercased()) }) else { return false }
         }
         return true
     }
@@ -996,7 +999,7 @@ let parent = getppid()
 if let window {
     log("capturing \(describe(window))")
 } else {
-    log("waiting for a window to share" + (options.title.map { " (title contains \"\($0)\")" } ?? ""))
+    log("waiting for a window to share" + (options.titles.isEmpty ? "" : " (title contains " + options.titles.map { "\"\($0)\"" }.joined(separator: " or ") + ")"))
 }
 if !options.snapshot && !options.wait {
     log(String(format: "every %.1fs, a frame when ≥%.0f%% of a settled screen is new (scrolls allowed for)%@ — Ctrl-C to stop",

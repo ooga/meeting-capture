@@ -77,7 +77,7 @@ do {
     expectEqual(base, "20260824_144024-teams-weekly-sync", "base name is stamp, app and slug")
     // The slides directory sits beside the transcript under the same name.
     expectEqual(SlideCapture.arguments(pid: 42, selection: TeamsApp().slideSelection!, directory: "/t/\(base).slides"),
-                ["--wait", "--ocr", "--pid", "42", "--title", "Shared content", "--out", "/t/20260824_144024-teams-weekly-sync.slides"],
+                ["--wait", "--ocr", "--pid", "42", "--title", "Shared content", "--title", "Contenu partagé", "--out", "/t/20260824_144024-teams-weekly-sync.slides"],
                 "slide helper waits for the pid's share window and writes beside the transcript")
     expectEqual(SlideCapture.arguments(pid: 7, selection: MeetApp().slideSelection!, directory: "/t/m.slides"),
                 ["--wait", "--ocr", "--pid", "7", "--title", "Meet - ", "--meet-stage", "--out", "/t/m.slides"],
@@ -112,11 +112,12 @@ do {
     if !FileManager.default.fileExists(atPath: helper) {
         let script = """
         #!/bin/sh
-        # args: --wait --ocr --pid P --title T --out DIR ($8 is DIR)
-        echo '{"type":"slide","n":1,"at":1793216486,"path":"'"$8"'/0001-144126.jpg","reason":"first frame"}'
-        echo '{"type":"revisit","n":1,"at":1793216490,"path":"'"$8"'/0001-144126.jpg"}'
+        # args: --wait --ocr --pid P (--title T)... --out DIR: DIR comes last
+        for out in "$@"; do :; done
+        echo '{"type":"slide","n":1,"at":1793216486,"path":"'"$out"'/0001-144126.jpg","reason":"first frame"}'
+        echo '{"type":"revisit","n":1,"at":1793216490,"path":"'"$out"'/0001-144126.jpg"}'
         echo "[log] meeting-capture-slides: waiting" >&2
-        trap 'echo "{\\"type\\":\\"slide\\",\\"n\\":2,\\"at\\":1793216500,\\"path\\":\\"$8/0002-144140.jpg\\"}"; exit 0' TERM
+        trap 'echo "{\\"type\\":\\"slide\\",\\"n\\":2,\\"at\\":1793216500,\\"path\\":\\"$out/0002-144140.jpg\\"}"; exit 0' TERM
         while :; do sleep 0.1; done
         """
         FileManager.default.createFile(atPath: helper, contents: Data(script.utf8),
@@ -204,8 +205,8 @@ do {
     }
     expectTrue(SlideEvent.parse(#"{"type":"revisit","n":4,"at":1}"#) == nil, "a revisit without an image is ignored")
 }
-expectEqual(TeamsApp().shareWindowTitle, "Shared content", "Teams shares open in a Shared content window")
-expectTrue(SlackApp().shareWindowTitle == nil, "Slack has no share window of its own")
+expectEqual(TeamsApp().shareWindowTitles, ["Shared content", "Contenu partagé"], "Teams shares open in a Shared content window, in English or French")
+expectTrue(SlackApp().shareWindowTitles.isEmpty, "Slack has no share window of its own")
 
 // --- Telling Google Meet's speakers from what they said -------------------
 // Meet writes name, sentences, name, sentences... but prunes old captions off
@@ -1503,6 +1504,45 @@ do {
                 "an empty parenthesised group is not a count")
 }
 
+// French Teams: the same title row reads « Dans cette réunion (20) » and
+// « Dans cette réunion, 20 au total ». Other sections (« Autres invités »)
+// list people who are not in the call and must neither count nor be counted.
+do {
+    expectEqual(rosterCount(from: ["Dans cette réunion (20)"]), 20,
+                "the French title row's parenthesised count reads")
+    expectEqual(rosterCount(from: ["Dans cette réunion, 20 au total"]), 20,
+                "the French section description's 'N au total' reads")
+    expectTrue(isInMeetingRosterSection(domID: "roster-title-section-9", texts: ["Dans cette réunion, 20 au total"]),
+               "the French in-meeting title is recognised by its text")
+    expectTrue(isInMeetingRosterSection(domID: "roster-title-section-9", texts: ["In this meeting (293)"]),
+               "the English in-meeting title is recognised by its text")
+    expectTrue(isInMeetingRosterSection(domID: "roster-title-section-2", texts: [""]),
+               "the in-meeting section is recognised by its id alone")
+    expectTrue(!isInMeetingRosterSection(domID: "roster-title-section-3", texts: ["Autres invités, 2 au total"]),
+               "other invitees are not the room")
+    expectTrue(!isInMeetingRosterSection(domID: "roster-title-section-4",
+                                         texts: ["Personnes ajoutées à la conversation (7)"]),
+               "people added to the chat are not the room")
+    expectEqual(bareName(from: "Ada Lovelace, Micro désactivé"), "Ada Lovelace",
+                "the French muted chip strips")
+    expectEqual(bareName(from: "Grace Hopper, Absent(e), Organisateur"), "Grace Hopper",
+                "French presence and role chips strip")
+    expectEqual(rosterBacklog("+12 de plus"), 12, "a translated unfetched placeholder still parses")
+}
+
+// Only people in the call are kept; with no section read at all, nobody is
+// dropped (an unrecognised layout lists everyone rather than no one).
+do {
+    let mixed = [RosterPerson(name: "In", key: "1", inMeeting: true),
+                 RosterPerson(name: "Invited", key: "2", inMeeting: false),
+                 RosterPerson(name: "Unknown", key: "3", inMeeting: nil)]
+    expectEqual(peopleInMeeting(mixed).map(\.name), ["In"],
+                "invitees and unplaced rows drop once sections are known")
+    let unplaced = [RosterPerson(name: "A", key: "1"), RosterPerson(name: "B", key: "2")]
+    expectEqual(peopleInMeeting(unplaced).map(\.name), ["A", "B"],
+                "with no sections read, everyone is kept")
+}
+
 // Row descriptions trail state chips: "Allen, Mary Catherine, Organizer,
 // Muted". The name is everything before them, and commas INSIDE the name
 // ("Last, First") survive because only trailing chips are stripped.
@@ -2254,18 +2294,6 @@ do {
         drive(s, app, from: 4, seconds: 600)
         expectEqual(app.presses.count, 2, "a toggle shortcut keeps its two blind tries")
     }
-}
-
-// --- keyCode(typing:) ---------------------------------------------------
-//
-// The captions shortcut is ⇧⌘A, but a key code is a physical key: code 0 is A
-// on QWERTY and Q on AZERTY, where ⇧⌘Q logs the user out. The key is looked
-// up by the letter it types in whatever layout this machine has.
-
-do {
-    expectTrue(keyCode(typing: "a") != nil, "some key types 'a' in the current layout")
-    expectTrue(keyCode(typing: "a") != keyCode(typing: "q"), "the A key is never the Q key")
-    expectEqual(keyCode(typing: "ab"), nil, "no single key types two letters")
 }
 
 // --- Summary ------------------------------------------------------------
