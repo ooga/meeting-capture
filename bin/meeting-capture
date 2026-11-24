@@ -3167,10 +3167,13 @@ func keyCode(typing character: String) -> CGKeyCode? {
 
 /// Which Slack windows might hold a huddle, in the order to search them:
 /// "Huddle…"-titled windows first (the cheap, common case), then any other
-/// secondary window. The main workspace window, marked "[Main]", is skipped —
-/// its tree is huge and a popped-out huddle never lives there.
+/// secondary window. The main workspace window, marked "[Main]" (« [principal] »
+/// in French), is skipped — its tree is huge and a popped-out huddle never
+/// lives there.
 func slackHuddleCandidates(titles: [String]) -> [Int] {
-    let eligible = titles.indices.filter { !titles[$0].contains("[Main]") }
+    let eligible = titles.indices.filter { index in
+        !["[Main]", "[principal]"].contains { titles[index].contains($0) }
+    }
     let huddles = eligible.filter { titles[$0].hasPrefix("Huddle") }
     return huddles + eligible.filter { !huddles.contains($0) }
 }
@@ -3254,6 +3257,15 @@ func slackHuddleTitle(_ raw: String) -> String {
     return name.isEmpty ? "Slack huddle" : name
 }
 
+/// The huddle's Leave button: "Leave Huddle", « Quitter l’appel d’équipe » in
+/// French (typographic apostrophes). Its CSS-module class, "leaveButton__<hash>",
+/// names it in any language, as long as Slack keeps that class name.
+func isSlackLeaveButton(description: String, classes: [String]) -> Bool {
+    let label = description.replacingOccurrences(of: "\u{2019}", with: "'")
+    return ["Leave Huddle", "Quitter l'appel d'équipe"].contains(label)
+        || classes.contains { $0.hasPrefix("leaveButton__") }
+}
+
 // Slack is Electron: its tree starts switched off until woken, and its
 // controls then carry DOM ids ("captions" tab) or AXIdentifier-style labels;
 // its caption overlay is found by class list. All serve as anchors.
@@ -3275,7 +3287,6 @@ final class SlackApp: MeetingApp {
     // that captions were switched off.
     var captionsSurfaceIsTransient: Bool { true }
 
-    private let leaveDescription = "Leave Huddle"
     private let overlayClass = "p-huddle_closed_captions"
     private let overlayEventClass = "p-huddle_closed_caption_event__wrapper"
     private let settledMarker = "fade_out"
@@ -3311,7 +3322,7 @@ final class SlackApp: MeetingApp {
     private func leaveButton(in window: AXUIElement) -> AXUIElement? {
         findElement(from: window) {
             axString($0, kAXRoleAttribute) == kAXButtonRole
-                && axDescription($0) == leaveDescription
+                && isSlackLeaveButton(description: axDescription($0), classes: axClasses($0))
         }
     }
 

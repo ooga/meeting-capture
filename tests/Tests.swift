@@ -1395,6 +1395,12 @@ do {
                     "- \(ws) - Slack",
                     "Huddle: #eert - \(ws) - Slack \u{1F3A4}",
                 ]), [2, 1], "Huddle-titled windows are searched first")
+    expectEqual(slackHuddleCandidates(titles: ["tech_clm - DT - Slack", "Appels d’équipe - DT - Slack [principal] 🏠🔊"]), [0],
+                "French Slack's main window, « [principal] », is skipped too")
+    expectTrue(isSlackLeaveButton(description: "Leave Huddle", classes: []), "English Leave button")
+    expectTrue(isSlackLeaveButton(description: "Quitter l’appel d’équipe", classes: []), "French Leave button, typographic apostrophes")
+    expectTrue(isSlackLeaveButton(description: "", classes: ["c-button-unstyled", "leaveButton__wzISw"]), "Leave button by its class, any language")
+    expectTrue(!isSlackLeaveButton(description: "Quitter", classes: ["c-button"]), "another button is not the Leave button")
     expectEqual(slackHuddleCandidates(titles: ["x - Slack [Main]"]), [],
                 "main window alone means no search")
 
