@@ -1397,6 +1397,17 @@ do {
                 ]), [2, 1], "Huddle-titled windows are searched first")
     expectEqual(slackHuddleCandidates(titles: ["tech_clm - DT - Slack", "Appels d’équipe - DT - Slack [principal] 🏠🔊"]), [0],
                 "French Slack's main window, « [principal] », is skipped too")
+    expectEqual(slackHuddleTitle("tech_mm - DT - 3 new items - Slack"), "tech_mm",
+                "the unread count in a huddle window title is not part of its name")
+    expectEqual(slackRosterNames([
+        SlackTile(description: "Consulter le profil de Johan Rouve", texts: []),
+        SlackTile(description: "Consulter le profil de Ambre Gauci Dalle", texts: ["Ambre Gauci Dalle"]),
+        SlackTile(description: "Consulter le profil de Radwane", texts: ["Radwane", "Video"]),
+        SlackTile(description: "Consulter le profil de Radwane", texts: ["Radwane"]),
+    ]), ["Johan Rouve", "Ambre Gauci Dalle", "Radwane"],
+                "huddle tiles: names once each, your own named from the shared description wording")
+    expectEqual(slackRosterNames([SlackTile(description: "View profile of Ada", texts: [])]), [],
+                "a nameless tile with nothing to learn the wording from is left out, not guessed")
     expectTrue(isSlackLeaveButton(description: "Leave Huddle", classes: []), "English Leave button")
     expectTrue(isSlackLeaveButton(description: "Quitter l’appel d’équipe", classes: []), "French Leave button, typographic apostrophes")
     expectTrue(isSlackLeaveButton(description: "", classes: ["c-button-unstyled", "leaveButton__wzISw"]), "Leave button by its class, any language")

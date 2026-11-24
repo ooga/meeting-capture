@@ -3252,9 +3252,73 @@ func slackHuddleTitle(_ raw: String) -> String {
     }
     var parts = (" " + title).components(separatedBy: " - ")
     if parts.count > 1, parts.last!.hasPrefix("Slack") { parts.removeLast() }
+    // "3 new items" / « 3 nouveaux éléments »: the unread count, not a name.
+    if parts.count > 1, parts.last!.range(of: "^\\d+ \\S", options: .regularExpression) != nil {
+        parts.removeLast()
+    }
     if parts.count > 1 { parts.removeLast() }  // the workspace
     let name = parts.joined(separator: " - ").trimmingCharacters(in: .whitespaces)
     return name.isEmpty ? "Slack huddle" : name
+}
+
+/// One huddle tile as read: its description ("View profile of Ada Lovelace",
+/// « Consulter le profil de Ada Lovelace ») and the texts inside it, whose
+/// first is the name shown on the tile. Your own tile shows no name.
+struct SlackTile {
+    let description: String
+    let texts: [String]
+}
+
+/// The names on a huddle's tiles, in order, each once (the gallery renders
+/// some tiles twice). A tile without a visible name, your own, is named from
+/// its description minus the wording every tile shares, learnt from the
+/// tiles that do show a name — so no language's phrasing is built in.
+func slackRosterNames(_ tiles: [SlackTile]) -> [String] {
+    let prefix = tiles.lazy.compactMap { tile -> String? in
+        guard let name = tile.texts.first, tile.description.hasSuffix(name),
+              tile.description.count > name.count else { return nil }
+        return String(tile.description.dropLast(name.count))
+    }.first
+    var seen = Set<String>()
+    var names: [String] = []
+    for tile in tiles {
+        var name = tile.texts.first ?? ""
+        if name.isEmpty, let prefix, tile.description.hasPrefix(prefix) {
+            name = String(tile.description.dropFirst(prefix.count))
+        }
+        name = name.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, seen.insert(name).inserted else { continue }
+        names.append(name)
+    }
+    return names
+}
+
+/// Who is in the huddle: every tile in the huddle window, gallery or the
+/// strip beside a screen share. Read only, nothing pressed. Slack pages the
+/// gallery (15 tiles a page) and offers no head count in the huddle window,
+/// so the list is confirmed only when it fits on one page.
+func captureSlackRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
+    let app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 5.0)
+    let windows = axWindows(app)
+    let titles = windows.map { axString($0, kAXTitleAttribute) }
+    let leave = { (e: AXUIElement) in
+        axString(e, kAXRoleAttribute) == kAXButtonRole
+            && isSlackLeaveButton(description: axDescription(e), classes: axClasses(e))
+    }
+    guard let window = slackHuddleCandidates(titles: titles).map({ windows[$0] })
+        .first(where: { findElement(from: $0, where: leave) != nil })
+    else { return .failed("no Slack huddle is running") }
+    let cells = findElements(from: window, limit: 400) { axClasses($0).contains("p-huddle_peer_tile") }
+    let names = slackRosterNames(cells.map {
+        SlackTile(description: axDescription($0), texts: axStaticTexts($0))
+    })
+    guard !names.isEmpty else { return .failed("the huddle shows no participant tiles") }
+    let paged = findElement(from: window, where: {
+        axClasses($0).contains("p-huddle_people_grid_view__next_button")
+    }) != nil
+    let people = names.map { RosterPerson(name: $0, key: $0) }
+    return .captured(RosterSnapshot(people: people, expected: paged ? nil : people.count))
 }
 
 /// The huddle's Leave button: "Leave Huddle", « Quitter l’appel d’équipe » in
@@ -3286,6 +3350,13 @@ final class SlackApp: MeetingApp {
     // to show, so it goes away during any pause. Absence means silence, not
     // that captions were switched off.
     var captionsSurfaceIsTransient: Bool { true }
+
+    // The tiles name everyone on screen, read without pressing anything.
+    let supportsRosterSnapshot = true
+    let rosterSnapshotIsQuiet = true
+    func captureRoster(pid: pid_t, deadline: Date?) -> RosterOutcome {
+        captureSlackRoster(pid: pid, deadline: deadline)
+    }
 
     private let overlayClass = "p-huddle_closed_captions"
     private let overlayEventClass = "p-huddle_closed_caption_event__wrapper"
