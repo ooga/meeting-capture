@@ -1438,6 +1438,9 @@ do {
                 "huddle tiles: names once each, your own named from the shared description wording")
     expectEqual(slackRosterNames([SlackTile(description: "View profile of Ada", texts: [])]), [],
                 "a nameless tile with nothing to learn the wording from is left out, not guessed")
+    expectTrue(slackPanelRow(["Cédric Laverdure", "joined the huddle."]) == nil, "a join in the Captions panel is not speech")
+    expectTrue(slackPanelRow(["Julien MAZARS", "reacted "]) == nil, "nor is a reaction")
+    expectEqual(slackPanelRow(["Johan Rouve", "Mhm mhm"]), SegmentKey(speaker: "Johan Rouve", text: "Mhm mhm"), "speech is kept")
     expectTrue(isSlackCaptionsMenuItem("Afficher les sous-titres"), "French ⋮ menu captions entry")
     expectTrue(isSlackCaptionsMenuItem("Show captions"), "English ⋮ menu captions entry")
     expectTrue(!isSlackCaptionsMenuItem("Langue de l’appel d’équipe"), "the language submenu is not the captions one")

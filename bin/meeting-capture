@@ -3192,8 +3192,14 @@ func slackPanelRow(_ texts: [String]) -> SegmentKey? {
     let speaker = texts[0]
     let text = texts.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespaces)
     guard !text.isEmpty, !speaker.hasPrefix("Captions are being generated"),
-          text != "Change huddle language" else { return nil }
+          text != "Change huddle language", !isSlackPanelNotice(text) else { return nil }
     return SegmentKey(speaker: speaker, text: text)
+}
+
+/// A Captions-panel row that is an event, not speech. Slack writes these in
+/// English even in French ("Cédric joined the huddle.", "… reacted 👍").
+func isSlackPanelNotice(_ text: String) -> Bool {
+    ["joined the huddle.", "left the huddle."].contains(text) || text.hasPrefix("reacted")
 }
 
 /// Stitch pages read top to bottom out of a virtualized list into one run.
@@ -3384,6 +3390,11 @@ final class SlackApp: MeetingApp {
     /// the huddle's whole conversation (see SegmentHistory) — hashing the text
     /// would collapse a repeated phrase into one utterance.
     private var history = SegmentHistory()
+    /// Overlay positions below this were read back from the Captions panel
+    /// at join and are already written: the overlay comes up showing the
+    /// same last few lines, and they must not land a second time.
+    private var recoveredUpTo = 0
+    private var lastRecovered: SegmentKey?
 
     /// The Leave button only exists while a huddle is up, so it — not the
     /// window title — is what identifies the huddle window. Titles proved
@@ -3429,12 +3440,6 @@ final class SlackApp: MeetingApp {
             return windows[index]
         }
         return nil
-    }
-
-    private func captionsTab(_ app: AXUIElement) -> AXUIElement? {
-        findElement(from: app) {
-            axDomID($0) == "captions" && axString($0, kAXRoleAttribute) == "AXRadioButton"
-        }
     }
 
     /// Captions surface both in the side flexpane's captions tab and as an
@@ -3511,8 +3516,15 @@ final class SlackApp: MeetingApp {
         // loses nothing when that happens.
         let base = history.absorb(settled.map { SegmentKey(speaker: $0.speaker, text: $0.text) })
         reportUnaligned(history, app: displayName)
-        var entries = settled.enumerated().map {
-            CaptionEntry(id: "seg:\(base + $0.offset)", speaker: $0.element.speaker, text: $0.element.text)
+        var entries = settled.enumerated().compactMap { offset, event -> CaptionEntry? in
+            guard base + offset >= recoveredUpTo else { return nil }
+            return CaptionEntry(id: "seg:\(base + offset)", speaker: event.speaker, text: event.text)
+        }
+        // Until the overlay moves past what was recovered, a live line equal
+        // to the last recovered one is that line, not a new one.
+        if let recovered = lastRecovered, base + settled.count <= recoveredUpTo,
+           let current = live, SegmentKey(speaker: current.speaker, text: current.text) == recovered {
+            live = nil
         }
         if let live {
             previousLiveText = live.text
@@ -3527,6 +3539,8 @@ final class SlackApp: MeetingApp {
         liveSequence = 0
         previousLiveText = ""
         history.reset()
+        recoveredUpTo = 0
+        lastRecovered = nil
         historyPhase = .toTop
         historyPages = []
         historyStill = 0
@@ -3593,6 +3607,12 @@ final class SlackApp: MeetingApp {
             if settled(on: rows.last?.key) || rows.isEmpty {
                 let merged = mergeCaptionPages(historyPages)
                 status("Slack caption history: read \(merged.count) row(s) over \(historyPages.count) page(s)")
+                // Number the overlay on from the recovered lines, so it
+                // recognises the ones it shows again when it comes up.
+                if !merged.isEmpty {
+                    recoveredUpTo = history.absorb(merged) + merged.count
+                    lastRecovered = merged.last
+                }
                 return merged
             }
             scroll(toward: rows.last?.element, in: list, up: false)
@@ -3672,22 +3692,37 @@ final class SlackApp: MeetingApp {
         captionsContainer(app) != nil
     }
 
-    /// Turn on "Show captions → In video" from the huddle's ⋮ menu: the
-    /// overlay this reader reads, and it needs no side panel open.
+    /// Turn on the caption overlay this reader reads, from the huddle's ⋮
+    /// menu → Show captions. It needs no side panel open.
+    ///
+    /// The submenu's two options are labelled the wrong way round in French
+    /// Slack (2026-11-25): the first, « À côté de la vidéo », draws the overlay
+    /// on the video, and the second, « Dans la vidéo », opens the side panel.
+    /// Their AX titles say what they really do ("Sous-titres fermés" and
+    /// "Côte à côte"). So the option is taken by position, the first one, and
+    /// the side panel's is never touched.
     ///
     /// Slack opens a submenu on hover only (AXPress and AXShowMenu on its item
     /// do nothing), but its menus follow the keyboard, and keys posted to the
-    /// process reach them even with Slack in the background (2026-11-25). So
-    /// the menu button is pressed, then ↓ to the captions item, → into its
-    /// submenu, ↓ to the second option and ↩. The submenu's AX titles do not
-    /// match what it shows ("Sous-titres fermés" for « À côté de la vidéo »),
-    /// so the option is taken by position: beside the video, then in it. An
-    /// option already checked is left alone, since choosing it again would
-    /// switch it off. Anything unexpected closes the menus and gives up.
-    private func showCaptionsInVideo(_ window: AXUIElement, pid: pid_t) -> CaptionRequest {
+    /// process reach them even with Slack in the background. So the menu
+    /// button is pressed, then ↓ to the captions item, → into its submenu
+    /// (which highlights the first option) and ↩. An option already checked is
+    /// left alone, since choosing it again would switch it off. Anything
+    /// unexpected closes the menus and gives up.
+    private func showCaptionsOverlay(_ window: AXUIElement, pid: pid_t) -> CaptionRequest {
+        // The ⋮ button: the last menu button in the toolbar that holds Leave,
+        // other than the participants list and the arrows beside the mic,
+        // camera and stickers. Slack nests it one level down with more people
+        // in the huddle, so it is searched for rather than taken as a sibling.
         guard let leave = leaveButton(in: window), let bar = axParent(leave),
-              let more = axChildren(bar).first(where: { axString($0, kAXRoleAttribute) == "AXPopUpButton" })
-        else { return .unreachable }
+              let more = findElements(from: bar, limit: 20, where: {
+                  axString($0, kAXRoleAttribute) == "AXPopUpButton"
+                      && !axClasses($0).contains { $0.hasPrefix("participantsMenuButton__") || $0.hasPrefix("segmentedButtonPopover__") }
+              }).last
+        else {
+            status("Slack ⋮ menu: no menu button beside Leave; will try again")
+            return .unreachable
+        }
         func key(_ code: CGKeyCode) {
             let source = CGEventSource(stateID: .privateState)
             CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)?.postToPid(pid)
@@ -3723,53 +3758,75 @@ final class SlackApp: MeetingApp {
             for _ in 0..<3 where !menus().isEmpty { key(53) }
         }
 
-        guard menus().isEmpty,
-              AXUIElementPerformAction(more, kAXPressAction as CFString) == .success,
-              let top = waitForMenus(1)?.first
-        else { close(); return .unreachable }
-        guard let entry = items(top).firstIndex(where: {
-                  axClasses($0).contains("c-menu_item__button--with_submenu")
-                      && isSlackCaptionsMenuItem(axString($0, kAXTitleAttribute))
-              }),
-              moveDown(in: top, to: entry)
-        else { close(); return .unreachable }
-        key(124)
-        guard let open = waitForMenus(2),
-              let sub = open.first(where: { !CFEqual($0, top) }),
-              items(sub).count == 2
-        else { close(); return .unreachable }
-        let inVideo = items(sub)[1]
-        if axClasses(inVideo).contains("c-menu_item__button--checked") {
+        /// Open ⋮ → Show captions and return its submenu's two options.
+        func openSubmenu() -> (overlay: AXUIElement, panel: AXUIElement)? {
+            guard menus().isEmpty,
+                  AXUIElementPerformAction(more, kAXPressAction as CFString) == .success,
+                  let top = waitForMenus(1)?.first,
+                  let entry = items(top).firstIndex(where: {
+                      axClasses($0).contains("c-menu_item__button--with_submenu")
+                          && isSlackCaptionsMenuItem(axString($0, kAXTitleAttribute))
+                  }),
+                  moveDown(in: top, to: entry)
+            else { close(); return nil }
+            key(124)
+            guard let open = waitForMenus(2),
+                  let sub = open.first(where: { !CFEqual($0, top) }),
+                  items(sub).count == 2
+            else { close(); return nil }
+            return (items(sub)[0], items(sub)[1])
+        }
+        func checked(_ item: AXUIElement) -> Bool {
+            axClasses(item).contains("c-menu_item__button--checked")
+        }
+        func state(_ options: (overlay: AXUIElement, panel: AXUIElement)) -> String {
+            "overlay \(checked(options.overlay) ? "on" : "off"), side panel \(checked(options.panel) ? "on" : "off")"
+        }
+
+        guard let before = openSubmenu() else {
+            status("Slack ⋮ menu: could not reach Show captions; will try again")
+            return .unreachable
+        }
+        if checked(before.overlay) {
+            status("Slack ⋮ menu: caption overlay already on (\(state(before)))")
             close()
             return .alreadyOn
         }
-        guard moveDown(in: sub, to: 1) else { close(); return .unreachable }
+        // Read the option again right before choosing it: Enter on one
+        // that is already on would switch it off.
+        guard moveDown(in: menus().last ?? window, to: 0),
+              let current = menus().last.map(items), current.count == 2,
+              !checked(current[0])
+        else {
+            status("Slack ⋮ menu: caption overlay looked on at the last moment; left alone")
+            close()
+            return .alreadyOn
+        }
         key(36)
-        usleep(300_000)
+        usleep(500_000)
         close()
+        // Give the menus time to go, or the reread finds them still open.
+        for _ in 0..<10 where !menus().isEmpty { usleep(100_000) }
+        // Check the result, so a wrong guess shows in the log and is not
+        // left switched off silently: the next attempt reads it again.
+        if let after = openSubmenu() {
+            status("Slack ⋮ menu: turned the caption overlay on (before: \(state(before)); after: \(state(after)))")
+            close()
+        } else {
+            status("Slack ⋮ menu: turned the caption overlay on (before: \(state(before)); could not reread)")
+        }
         return .pressed
     }
 
-    /// The control is a tab, not a toggle: selecting it starts captions and
-    /// selecting it again is a no-op. But switching tabs is the user's
-    /// business, so only reach for it when captions are nowhere to be found.
-    /// If the overlay is up, captions are already running and whatever tab
-    /// they are reading is left alone.
+    /// Only the overlay is worth turning on, since it is what gets read: the
+    /// side panel's Captions tab, which this used to select, fills the panel
+    /// and leaves the overlay off (2026-11-25), and it took the user's tab.
     func requestCaptions(pid: pid_t) -> CaptionRequest {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
         if captionsContainer(app) != nil { return .alreadyOn }
-        if let window = huddleWindow(app) {
-            switch showCaptionsInVideo(window, pid: pid) {
-            case .pressed: return .pressed
-            case .alreadyOn: return .alreadyOn
-            case .unreachable: break
-            }
-        }
-        guard let tab = captionsTab(app) else { return .unreachable }
-        guard AXUIElementPerformAction(tab, kAXPressAction as CFString) == .success
-        else { return .unreachable }
-        return .pressed
+        guard let window = huddleWindow(app) else { return .unreachable }
+        return showCaptionsOverlay(window, pid: pid)
     }
 }
 
@@ -5441,6 +5498,20 @@ final class Session {
     /// If not, the app accepted the press and ignored it (Meet did, twice, at
     /// the start of a call on 2026-10-22), so say so and press again later.
     /// Internal so tests can drive it with a scripted app.
+    /// The meeting was left and rejoined within one session: captions seen
+    /// before prove nothing about now, so check them again from scratch.
+    func meetingRejoined() {
+        sawCaptions = false
+        captionAttempts = 0
+        captionPressCheckAt = nil
+        nextCaptionCheck = .distantPast
+        warnedCaptionsUnreachable = false
+        captionsContainer = nil
+        if !options.quiet {
+            status("rejoined \"\(title)\" in \(meetingApp.displayName); checking captions again")
+        }
+    }
+
     func ensureCaptionsOn(app: AXUIElement, pid: pid_t, now: Date) {
         let name = meetingApp.displayName
         if meetingApp.captionsPanelOpen(app) {
@@ -6744,6 +6815,8 @@ func startSlides(_ attached: Attachment, title: String, session: Session) {
 }
 var waker = TreeWaker(quiet: options.quiet)
 var leaveMissingSince: Date?
+/// The Leave button last seen, to notice the meeting UI being rebuilt.
+var lastAnchor: AXUIElement?
 var treeUnreadableSince: Date?
 
 if options.once {
@@ -6897,7 +6970,14 @@ while !stopRequested {
                         status("cannot read the \(current.meetingApp.displayName) accessibility tree")
                     }
                 }
-            } else if current.meetingApp.meetingAnchor(current.element) != nil {
+            } else if let anchor = current.meetingApp.meetingAnchor(current.element) {
+                // Back after an absence as a different element: the meeting
+                // was left and rejoined faster than the debounce below, and
+                // the app may have reset its captions meanwhile (Slack does).
+                if leaveMissingSince != nil, let previous = lastAnchor, !CFEqual(previous, anchor) {
+                    session?.meetingRejoined()
+                }
+                lastAnchor = anchor
                 leaveMissingSince = nil
                 treeUnreadableSince = nil
             } else {
