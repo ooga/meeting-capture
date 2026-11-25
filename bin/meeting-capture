@@ -1568,6 +1568,11 @@ protocol MeetingApp {
     /// [] when there is none to read. Runs under UIAutomation.
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]?
 
+    /// True while captions are not on yet, so there is no history to read
+    /// and the read waits rather than giving up: the transcript panel only
+    /// starts filling once someone turns captions on.
+    func captionHistoryWaiting(_ app: AXUIElement) -> Bool
+
     /// Called every poll while a meeting is being recorded, so an app can keep
     /// the surfaces it reads from readable — Teams stops updating a meeting
     /// window that another window completely covers, and its chat panel may
@@ -1672,6 +1677,7 @@ extension MeetingApp {
     func resetCaptureState() {}
     // No app but Slack keeps a scrollable transcript we can read back.
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? { [] }
+    func captionHistoryWaiting(_ app: AXUIElement) -> Bool { false }
     // Only Teams parks a covered window; everyone else keeps rendering.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
                           popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {}
@@ -3321,6 +3327,13 @@ func captureSlackRoster(pid: pid_t, deadline: Date? = nil) -> RosterOutcome {
     return .captured(RosterSnapshot(people: people, expected: paged ? nil : people.count))
 }
 
+/// The huddle ⋮ menu's "Show captions" entry, which opens a submenu.
+/// Only the French label has been seen; the English one is a guess.
+func isSlackCaptionsMenuItem(_ title: String) -> Bool {
+    let label = title.lowercased()
+    return label.contains("sous-titres") || label.contains("caption")
+}
+
 /// The huddle's Leave button: "Leave Huddle", « Quitter l’appel d’équipe » in
 /// French (typographic apostrophes). Its CSS-module class, "leaveButton__<hash>",
 /// names it in any language, as long as Slack keeps that class name.
@@ -3541,6 +3554,15 @@ final class SlackApp: MeetingApp {
     private let virtualListClass = "c-virtual_list__scroll_container"
     private let virtualItemClass = "c-virtual_list__item"
 
+    /// Neither the Captions list nor the overlay is showing. The overlay
+    /// also hides during silences, so this can wait a little longer than
+    /// needed, never less.
+    func captionHistoryWaiting(_ app: AXUIElement) -> Bool {
+        guard let window = huddleWindow(app) else { return false }
+        return captionsPanelList(window) == nil
+            && findElement(from: window, where: { axClasses($0).contains(self.overlayClass) }) == nil
+    }
+
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? {
         guard let window = huddleWindow(app) else { return nil }
         guard let list = captionsPanelList(window) else {
@@ -3650,6 +3672,84 @@ final class SlackApp: MeetingApp {
         captionsContainer(app) != nil
     }
 
+    /// Turn on "Show captions → In video" from the huddle's ⋮ menu: the
+    /// overlay this reader reads, and it needs no side panel open.
+    ///
+    /// Slack opens a submenu on hover only (AXPress and AXShowMenu on its item
+    /// do nothing), but its menus follow the keyboard, and keys posted to the
+    /// process reach them even with Slack in the background (2026-11-25). So
+    /// the menu button is pressed, then ↓ to the captions item, → into its
+    /// submenu, ↓ to the second option and ↩. The submenu's AX titles do not
+    /// match what it shows ("Sous-titres fermés" for « À côté de la vidéo »),
+    /// so the option is taken by position: beside the video, then in it. An
+    /// option already checked is left alone, since choosing it again would
+    /// switch it off. Anything unexpected closes the menus and gives up.
+    private func showCaptionsInVideo(_ window: AXUIElement, pid: pid_t) -> CaptionRequest {
+        guard let leave = leaveButton(in: window), let bar = axParent(leave),
+              let more = axChildren(bar).first(where: { axString($0, kAXRoleAttribute) == "AXPopUpButton" })
+        else { return .unreachable }
+        func key(_ code: CGKeyCode) {
+            let source = CGEventSource(stateID: .privateState)
+            CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)?.postToPid(pid)
+            CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)?.postToPid(pid)
+            usleep(200_000)
+        }
+        func menus() -> [AXUIElement] {
+            findElements(from: window, limit: 4) { axClasses($0).contains("c-menu__items") }
+        }
+        func items(_ menu: AXUIElement) -> [AXUIElement] {
+            axChildren(menu).filter { axString($0, kAXRoleAttribute) == "AXMenuItem" }
+        }
+        func highlighted(_ menu: AXUIElement) -> Int? {
+            items(menu).firstIndex { axClasses($0).contains("c-menu_item__button--highlighted") }
+        }
+        /// ↓ until `target` is highlighted, or give up after a lap.
+        func moveDown(in menu: AXUIElement, to target: Int) -> Bool {
+            for _ in 0...items(menu).count + 1 {
+                if highlighted(menu) == target { return true }
+                key(125)
+            }
+            return highlighted(menu) == target
+        }
+        func waitForMenus(_ count: Int) -> [AXUIElement]? {
+            for _ in 0..<10 {
+                let found = menus()
+                if found.count >= count { return found }
+                usleep(100_000)
+            }
+            return nil
+        }
+        func close() {
+            for _ in 0..<3 where !menus().isEmpty { key(53) }
+        }
+
+        guard menus().isEmpty,
+              AXUIElementPerformAction(more, kAXPressAction as CFString) == .success,
+              let top = waitForMenus(1)?.first
+        else { close(); return .unreachable }
+        guard let entry = items(top).firstIndex(where: {
+                  axClasses($0).contains("c-menu_item__button--with_submenu")
+                      && isSlackCaptionsMenuItem(axString($0, kAXTitleAttribute))
+              }),
+              moveDown(in: top, to: entry)
+        else { close(); return .unreachable }
+        key(124)
+        guard let open = waitForMenus(2),
+              let sub = open.first(where: { !CFEqual($0, top) }),
+              items(sub).count == 2
+        else { close(); return .unreachable }
+        let inVideo = items(sub)[1]
+        if axClasses(inVideo).contains("c-menu_item__button--checked") {
+            close()
+            return .alreadyOn
+        }
+        guard moveDown(in: sub, to: 1) else { close(); return .unreachable }
+        key(36)
+        usleep(300_000)
+        close()
+        return .pressed
+    }
+
     /// The control is a tab, not a toggle: selecting it starts captions and
     /// selecting it again is a no-op. But switching tabs is the user's
     /// business, so only reach for it when captions are nowhere to be found.
@@ -3659,6 +3759,13 @@ final class SlackApp: MeetingApp {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 5.0)
         if captionsContainer(app) != nil { return .alreadyOn }
+        if let window = huddleWindow(app) {
+            switch showCaptionsInVideo(window, pid: pid) {
+            case .pressed: return .pressed
+            case .alreadyOn: return .alreadyOn
+            case .unreachable: break
+            }
+        }
         guard let tab = captionsTab(app) else { return .unreachable }
         guard AXUIElementPerformAction(tab, kAXPressAction as CFString) == .success
         else { return .unreachable }
@@ -5092,6 +5199,12 @@ final class Session {
     /// because the app may switch tabs or scroll; losing the lock just means
     /// trying again next poll.
     private func advanceHistory(app: AXUIElement, now: Date) {
+        // Captions not on yet: nothing to read, and the budget starts once
+        // they are, so the lines said before we joined are still recovered.
+        if meetingApp.captionHistoryWaiting(app) {
+            historyDeadline = clock.now().addingTimeInterval(Session.historyBudgetSeconds)
+            return
+        }
         var history: [SegmentKey]?
         if UIAutomation.tryEnter() {
             history = meetingApp.captionHistoryStep(app)

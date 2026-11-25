@@ -1438,6 +1438,9 @@ do {
                 "huddle tiles: names once each, your own named from the shared description wording")
     expectEqual(slackRosterNames([SlackTile(description: "View profile of Ada", texts: [])]), [],
                 "a nameless tile with nothing to learn the wording from is left out, not guessed")
+    expectTrue(isSlackCaptionsMenuItem("Afficher les sous-titres"), "French ⋮ menu captions entry")
+    expectTrue(isSlackCaptionsMenuItem("Show captions"), "English ⋮ menu captions entry")
+    expectTrue(!isSlackCaptionsMenuItem("Langue de l’appel d’équipe"), "the language submenu is not the captions one")
     expectTrue(isSlackLeaveButton(description: "Leave Huddle", classes: []), "English Leave button")
     expectTrue(isSlackLeaveButton(description: "Quitter l’appel d’équipe", classes: []), "French Leave button, typographic apostrophes")
     expectTrue(isSlackLeaveButton(description: "", classes: ["c-button-unstyled", "leaveButton__wzISw"]), "Leave button by its class, any language")
