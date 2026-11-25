@@ -957,6 +957,36 @@ do {
     expectTrue(jsonl.string.contains("\"lost_events\":0"), "recovery means zero events reported lost")
 }
 
+// A roster read before anything was recorded waits in memory: a meeting
+// whose captions never came on (a Slack huddle without them) leaves no file.
+// The first real event writes it, ahead of itself.
+do {
+    let roster = RosterSnapshot(people: [RosterPerson(name: "A", key: "1"),
+                                         RosterPerson(name: "B", key: "2")], expected: 2)
+    let quiet = injectedSession(clock: FakeClock(start: epoch, step: 0.25))
+    quiet.sleepFn = { _ in }
+    quiet.writeRoster(roster, at: epoch)
+    expectTrue(quiet.recorder == nil, "a roster alone does not start a transcript")
+    expectTrue(quiet.heldRoster != nil, "the roster is held for the first caption")
+    quiet.finish(at: epoch.addingTimeInterval(60))
+    expectTrue(quiet.recorder == nil, "a meeting with nothing said leaves no file")
+
+    let s = injectedSession(clock: FakeClock(start: epoch, step: 0.25))
+    s.writeRoster(roster, at: epoch)
+    let jsonl = MemorySink(path: "/tmp/held-roster.jsonl")
+    let text = MemorySink(path: "/tmp/held-roster.txt")
+    s.recorder = Recorder(options: Options(), startedAt: epoch, mode: .elapsed(from: epoch),
+                          jsonlURL: URL(fileURLWithPath: jsonl.path),
+                          textURL: URL(fileURLWithPath: text.path),
+                          jsonl: jsonl, text: text)
+    s.noteSlide(SlideEvent(number: 1, at: epoch.addingTimeInterval(30), path: "/tmp/1.jpg", reason: "new"))
+    let types = jsonl.string.split(separator: "\n").compactMap {
+        (try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])?["type"] as? String
+    }
+    expectEqual(types, ["people", "slide"], "the held roster is written just before the first event")
+    expectTrue(s.heldRoster == nil, "and only once")
+}
+
 // Caption history lands before the live captions held back while it was
 // read, tagged as history, with the line both sources caught written once.
 do {

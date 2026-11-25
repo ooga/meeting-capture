@@ -4787,6 +4787,10 @@ final class Session {
     private let rosterInbox = RosterInbox()
     private var rosterRunning = false
     private var rosterDone = false
+    /// A roster read before anything else was recorded. It waits here so a
+    /// meeting with no transcript (captions never turned on) leaves no file;
+    /// the first real event writes it ahead of itself.
+    var heldRoster: (snapshot: RosterSnapshot, at: Date)?
     /// An explicit re-read request waiting for its lull. Set by consuming
     /// the roster-now file; cleared when its snapshot lands (or its hunt
     /// expires, or its attempts run out).
@@ -4968,6 +4972,10 @@ final class Session {
         if historyPending && kind == "caption" {
             heldCaptions.append((speaker, body, date, extra))
             return
+        }
+        if let held = heldRoster {
+            heldRoster = nil
+            writeRoster(held.snapshot, at: held.at, flushing: true)
         }
         guard pendingWrites.isEmpty else {
             pendingWrites.append(.event(
@@ -5220,7 +5228,14 @@ final class Session {
     /// Write the roster as one event: a `people` line in the transcript and a
     /// `people` record in the jsonl carrying the names as a list, so it can be
     /// read by machine without parsing the sentence.
-    private func writeRoster(_ snapshot: RosterSnapshot, at date: Date) {
+    func writeRoster(_ snapshot: RosterSnapshot, at date: Date, flushing: Bool = false) {
+        guard flushing || recorder != nil || !pendingWrites.isEmpty else {
+            heldRoster = (snapshot, date)
+            if !options.quiet {
+                status("read the participant list (\(snapshot.headline)); it is recorded with the first caption")
+            }
+            return
+        }
         let names = snapshot.people.map(\.name)
         var extra: [String: Any] = [
             "people": names,
