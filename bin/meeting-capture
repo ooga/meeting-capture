@@ -1332,6 +1332,8 @@ struct SegmentKey: Hashable {
 
 final class SegmentHistory {
     private var keys: [SegmentKey] = []
+    /// The newest segments held, oldest first.
+    func recent(_ count: Int) -> [SegmentKey] { Array(keys.suffix(count)) }
     /// Segments already dropped off the front of `keys`.
     private var dropped = 0
     /// The widest window absorbed so far, which sets how much has to be kept.
@@ -1573,6 +1575,15 @@ protocol MeetingApp {
     /// starts filling once someone turns captions on.
     func captionHistoryWaiting(_ app: AXUIElement) -> Bool
 
+    /// True while the meeting window still exists but cannot be read: on
+    /// another Space (full screen) or minimised. The session pauses instead
+    /// of ending. `title` is the session's meeting title.
+    func meetingOutOfView(pid: pid_t, title: String) -> Bool
+
+    /// The meeting window is back in view: the next history read is a
+    /// catch-up, returning only what was said while it was out of view.
+    func beginCaptionCatchUp()
+
     /// Called every poll while a meeting is being recorded, so an app can keep
     /// the surfaces it reads from readable — Teams stops updating a meeting
     /// window that another window completely covers, and its chat panel may
@@ -1678,6 +1689,8 @@ extension MeetingApp {
     // No app but Slack keeps a scrollable transcript we can read back.
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? { [] }
     func captionHistoryWaiting(_ app: AXUIElement) -> Bool { false }
+    func meetingOutOfView(pid: pid_t, title: String) -> Bool { false }
+    func beginCaptionCatchUp() {}
     // Only Teams parks a covered window; everyone else keeps rendering.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
                           popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {}
@@ -3196,6 +3209,45 @@ func slackPanelRow(_ texts: [String]) -> SegmentKey? {
     return SegmentKey(speaker: speaker, text: text)
 }
 
+/// The Captions-panel rows said after the last lines already recorded, or
+/// nil when nothing recorded can be found in the panel. `recorded` is the
+/// tail of what was written, oldest first.
+///
+/// The panel can merge a speaker's consecutive lines into one row, so a
+/// recorded line matches a row that contains it. Short lines ("Ouais.")
+/// recur, so the anchor is the longest recent line, and the shorter ones
+/// recorded after it are then skipped off the front of what follows.
+func slackRowsAfter(_ rows: [SegmentKey], recorded: [SegmentKey]) -> [SegmentKey]? {
+    let tail = Array(recorded.suffix(10))
+    let byLength = tail.indices.sorted { tail[$0].text.count > tail[$1].text.count }
+    for anchor in byLength {
+        let line = tail[anchor]
+        guard let row = rows.lastIndex(where: { $0.speaker == line.speaker && $0.text.contains(line.text) })
+        else { continue }
+        var missed = Array(rows[(row + 1)...])
+        for later in tail[(anchor + 1)...] {
+            guard let first = missed.first, first.speaker == later.speaker,
+                  first.text.contains(later.text) || later.text.contains(first.text) else { continue }
+            missed.removeFirst()
+        }
+        return missed
+    }
+    return nil
+}
+
+/// Whether a window list still holds this huddle's window while the
+/// accessibility tree cannot see it: a Slack window that is not the main one
+/// and carries the huddle's title. On screen or not: coming back to a full
+/// screen Space, the window server shows it on screen a moment before the
+/// accessibility tree has it again (2026-11-25). Only its closing ends the
+/// huddle. Names need Screen Recording permission; without it no window
+/// matches and the caller falls back to ending the session.
+func slackHuddleOutOfView(windows: [(name: String, onScreen: Bool)], title: String) -> Bool {
+    let hidden = windows.filter { !$0.name.isEmpty }
+    return slackHuddleCandidates(titles: hidden.map(\.name))
+        .contains { slackHuddleTitle(hidden[$0].name) == title }
+}
+
 /// A Captions-panel row that is an event, not speech. Slack writes these in
 /// English even in French ("Cédric joined the huddle.", "… reacted 👍").
 func isSlackPanelNotice(_ text: String) -> Bool {
@@ -3343,7 +3395,14 @@ func isSlackCaptionsMenuItem(_ title: String) -> Bool {
 /// The huddle's Leave button: "Leave Huddle", « Quitter l’appel d’équipe » in
 /// French (typographic apostrophes). Its CSS-module class, "leaveButton__<hash>",
 /// names it in any language, as long as Slack keeps that class name.
+///
+/// The main window has a Leave button too, in the huddle's channel header
+/// (class p-huddle_channel_header_button__leave_button). It is not the
+/// huddle window's: the main window is not always marked « [principal] »,
+/// and taking it for the huddle meant reading captions where there are none
+/// while the real huddle window was out of view (2026-11-25).
 func isSlackLeaveButton(description: String, classes: [String]) -> Bool {
+    if classes.contains(where: { $0.hasPrefix("p-huddle_channel_header_button") }) { return false }
     let label = description.replacingOccurrences(of: "\u{2019}", with: "'")
     return ["Leave Huddle", "Quitter l'appel d'équipe"].contains(label)
         || classes.contains { $0.hasPrefix("leaveButton__") }
@@ -3395,6 +3454,19 @@ final class SlackApp: MeetingApp {
     /// same last few lines, and they must not land a second time.
     private var recoveredUpTo = 0
     private var lastRecovered: SegmentKey?
+    /// The overlay's line still being spoken, last seen: it is written but
+    /// not in `history`, and a catch-up must know it was recorded.
+    private var lastLive: SegmentKey?
+    /// The next history read only fills in what was missed out of view.
+    private var catchingUp = false
+    /// Not before this: Slack transcribes a few seconds behind speech, so the
+    /// last lines said out of view reach the panel after the window is back.
+    private var catchUpNotBefore = Date.distantPast
+    /// Whether the side panel's captions were checked to be on, which the
+    /// overlay being up says nothing about. Tries are spaced and capped.
+    private var panelEnsured = false
+    private var panelTries = 0
+    private var nextPanelTry = Date.distantPast
 
     /// The Leave button only exists while a huddle is up, so it — not the
     /// window title — is what identifies the huddle window. Titles proved
@@ -3414,10 +3486,16 @@ final class SlackApp: MeetingApp {
     /// huddle costs one subtree walk per poll rather than one per window.
     private var cachedHuddleWindow: AXUIElement?
 
+    /// Not the one in the main window's bottom bar either, which Slack shows
+    /// while the huddle window is elsewhere, beside « Amener l'appel d'équipe
+    /// au premier plan » (class openHuddleWindow…).
     private func leaveButton(in window: AXUIElement) -> AXUIElement? {
         findElement(from: window) {
             axString($0, kAXRoleAttribute) == kAXButtonRole
                 && isSlackLeaveButton(description: axDescription($0), classes: axClasses($0))
+                && !(axParent($0).map(axChildren) ?? []).contains { sibling in
+                    axClasses(sibling).contains { $0.hasPrefix("openHuddleWindow") }
+                }
         }
     }
 
@@ -3527,6 +3605,7 @@ final class SlackApp: MeetingApp {
             live = nil
         }
         if let live {
+            lastLive = SegmentKey(speaker: live.speaker, text: live.text)
             previousLiveText = live.text
             // Last, so the recorder treats it as the line still being spoken
             // and leaves it out of idle finalization.
@@ -3541,6 +3620,11 @@ final class SlackApp: MeetingApp {
         history.reset()
         recoveredUpTo = 0
         lastRecovered = nil
+        lastLive = nil
+        catchingUp = false
+        panelEnsured = false
+        panelTries = 0
+        nextPanelTry = .distantPast
         historyPhase = .toTop
         historyPages = []
         historyStill = 0
@@ -3568,6 +3652,55 @@ final class SlackApp: MeetingApp {
     private let virtualListClass = "c-virtual_list__scroll_container"
     private let virtualItemClass = "c-virtual_list__item"
 
+    /// Captions are only turned on when none are showing, so with the
+    /// overlay already up the side panel could stay off, and with it the
+    /// transcript the catch-up reads. Check it once per huddle, quietly when
+    /// the panel's list is already there.
+    func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
+                          popOutCaptions: Bool, popOutChat: Bool, popOutShare: Bool) {
+        guard !panelEnsured, panelTries < 3, now >= nextPanelTry,
+              let window = huddleWindow(app) else { return }
+        if captionsPanelList(window) != nil { panelEnsured = true; return }
+        panelTries += 1
+        nextPanelTry = now.addingTimeInterval(20)
+        if showCaptionsOverlay(window, pid: pid) != .unreachable { panelEnsured = true }
+    }
+
+    func meetingOutOfView(pid: pid_t, title: String) -> Bool {
+        // A huddle window the tree can see, with no Leave button in it, is a
+        // huddle that ended, not one out of view.
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 2.0)
+        if axWindows(app).contains(where: { slackHuddleTitle(axString($0, kAXTitleAttribute)) == title
+                                             && !axString($0, kAXTitleAttribute).contains("[") }) {
+            return false
+        }
+        let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        let windows = list.filter {
+            ($0[kCGWindowOwnerPID as String] as? pid_t) == pid && ($0[kCGWindowLayer as String] as? Int) == 0
+        }.map {
+            (name: ($0[kCGWindowName as String] as? String) ?? "",
+             onScreen: ($0[kCGWindowIsOnscreen as String] as? Bool) ?? false)
+        }
+        return slackHuddleOutOfView(windows: windows, title: title)
+    }
+
+    func beginCaptionCatchUp() {
+        panelEnsured = false
+        panelTries = 0
+        // Let the tree settle after the window comes back before trusting
+        // what the menu says is checked.
+        nextPanelTry = Date().addingTimeInterval(5)
+        catchingUp = true
+        catchUpNotBefore = Date().addingTimeInterval(6)
+        historyPhase = .toTop
+        historyPages = []
+        historyStill = 0
+        historyMarker = nil
+        historyPressedTab = false
+        historyLocateTries = 0
+    }
+
     /// Neither the Captions list nor the overlay is showing. The overlay
     /// also hides during silences, so this can wait a little longer than
     /// needed, never less.
@@ -3578,6 +3711,7 @@ final class SlackApp: MeetingApp {
     }
 
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? {
+        if catchingUp && Date() < catchUpNotBefore { return nil }
         guard let window = huddleWindow(app) else { return nil }
         guard let list = captionsPanelList(window) else {
             // Switching tabs is normally the user's business, but reading the
@@ -3605,8 +3739,18 @@ final class SlackApp: MeetingApp {
         case .collect:
             historyPages.append(rows.map(\.key))
             if settled(on: rows.last?.key) || rows.isEmpty {
-                let merged = mergeCaptionPages(historyPages)
+                var merged = mergeCaptionPages(historyPages)
                 status("Slack caption history: read \(merged.count) row(s) over \(historyPages.count) page(s)")
+                if catchingUp {
+                    catchingUp = false
+                    let recorded = history.recent(10) + (lastLive.map { [$0] } ?? [])
+                    if let missed = slackRowsAfter(merged, recorded: recorded) {
+                        merged = missed
+                    } else {
+                        status("Slack caption catch-up: none of the last lines recorded is in the Captions panel; nothing recovered")
+                        merged = []
+                    }
+                }
                 // Number the overlay on from the recovered lines, so it
                 // recognises the ones it shows again when it comes up.
                 if !merged.isEmpty {
@@ -3692,15 +3836,15 @@ final class SlackApp: MeetingApp {
         captionsContainer(app) != nil
     }
 
-    /// Turn on the caption overlay this reader reads, from the huddle's ⋮
-    /// menu → Show captions. It needs no side panel open.
+    /// Turn on both caption views from the huddle's ⋮ menu → Show captions:
+    /// the overlay, which is what is read live, and the side panel, whose
+    /// Captions tab keeps the whole huddle for the history and catch-up reads.
     ///
     /// The submenu's two options are labelled the wrong way round in French
     /// Slack (2026-11-25): the first, « À côté de la vidéo », draws the overlay
     /// on the video, and the second, « Dans la vidéo », opens the side panel.
     /// Their AX titles say what they really do ("Sous-titres fermés" and
-    /// "Côte à côte"). So the option is taken by position, the first one, and
-    /// the side panel's is never touched.
+    /// "Côte à côte"). So options are taken by position.
     ///
     /// Slack opens a submenu on hover only (AXPress and AXShowMenu on its item
     /// do nothing), but its menus follow the keyboard, and keys posted to the
@@ -3776,45 +3920,59 @@ final class SlackApp: MeetingApp {
             else { close(); return nil }
             return (items(sub)[0], items(sub)[1])
         }
+        /// Either sign of a check: the class, or the checkmark drawn in it.
         func checked(_ item: AXUIElement) -> Bool {
             axClasses(item).contains("c-menu_item__button--checked")
+                || axChildren(item).contains { axClasses($0).contains("c-menu_item__checkmark") }
         }
-        func state(_ options: (overlay: AXUIElement, panel: AXUIElement)) -> String {
-            "overlay \(checked(options.overlay) ? "on" : "off"), side panel \(checked(options.panel) ? "on" : "off")"
+        /// The submenu's options as they read once Slack has drawn their
+        /// checks. Read the instant it opens, both came out unchecked with
+        /// the overlay on (2026-11-25, seen on a screen recording), so it is
+        /// read twice, a moment apart, and an option counts as off only if
+        /// both reads say so: Enter on an option that is on switches it off.
+        func settledOff() -> (overlay: Bool, panel: Bool)? {
+            usleep(400_000)
+            guard let first = menus().last.map(items), first.count == 2 else { return nil }
+            usleep(400_000)
+            guard let second = menus().last.map(items), second.count == 2 else { return nil }
+            return (!checked(first[0]) && !checked(second[0]),
+                    !checked(first[1]) && !checked(second[1]))
+        }
+        // Captions on screen mean the overlay is on, whatever the menu says.
+        let overlayShowing = findElement(from: window) { axClasses($0).contains(self.overlayClass) } != nil
+        func describe(_ off: (overlay: Bool, panel: Bool)) -> String {
+            "overlay \(off.overlay ? "off" : "on"), side panel \(off.panel ? "off" : "on")"
         }
 
-        guard let before = openSubmenu() else {
+        // One opening reads the state and chooses the first option that is
+        // off there and then. Choosing closes the menu, so it is opened again
+        // only when the first read found both options off.
+        guard openSubmenu() != nil, let off = settledOff() else {
+            close()
             status("Slack ⋮ menu: could not reach Show captions; will try again")
             return .unreachable
         }
-        if checked(before.overlay) {
-            status("Slack ⋮ menu: caption overlay already on (\(state(before)))")
+        let seen = describe(off)
+        let plan = [0, 1].filter { $0 == 0 ? off.overlay && !overlayShowing : off.panel }
+        var turnedOn: [String] = []
+        for (step, target) in plan.enumerated() {
+            if step > 0 {
+                // Read again before choosing: Enter on an option that is on
+                // switches it off.
+                guard openSubmenu() != nil, let now = settledOff(), target == 0 ? now.overlay : now.panel
+                else { close(); break }
+            }
+            guard moveDown(in: menus().last ?? window, to: target) else { close(); break }
+            key(36)
+            turnedOn.append(target == 0 ? "overlay" : "side panel")
+            usleep(500_000)
             close()
-            return .alreadyOn
+            // Give the menus time to go, or the next opening finds them.
+            for _ in 0..<10 where !menus().isEmpty { usleep(100_000) }
         }
-        // Read the option again right before choosing it: Enter on one
-        // that is already on would switch it off.
-        guard moveDown(in: menus().last ?? window, to: 0),
-              let current = menus().last.map(items), current.count == 2,
-              !checked(current[0])
-        else {
-            status("Slack ⋮ menu: caption overlay looked on at the last moment; left alone")
-            close()
-            return .alreadyOn
-        }
-        key(36)
-        usleep(500_000)
-        close()
-        // Give the menus time to go, or the reread finds them still open.
-        for _ in 0..<10 where !menus().isEmpty { usleep(100_000) }
-        // Check the result, so a wrong guess shows in the log and is not
-        // left switched off silently: the next attempt reads it again.
-        if let after = openSubmenu() {
-            status("Slack ⋮ menu: turned the caption overlay on (before: \(state(before)); after: \(state(after)))")
-            close()
-        } else {
-            status("Slack ⋮ menu: turned the caption overlay on (before: \(state(before)); could not reread)")
-        }
+        if plan.isEmpty { close() }
+        guard !turnedOn.isEmpty else { return .alreadyOn }
+        status("Slack ⋮ menu: read \(seen); turned on \(turnedOn.joined(separator: " and "))")
         return .pressed
     }
 
@@ -5281,14 +5439,20 @@ final class Session {
         let live = heldCaptions.map { SegmentKey(speaker: $0.speaker, text: $0.body) }
             + captionOrder.compactMap { activeCaptions[$0] }.map { SegmentKey(speaker: $0.speaker, text: $0.text) }
         let kept = trimCaptionHistory(history, against: live)
+        // Spoken before we joined, or while the window was out of view, at
+        // times the panel does not show: stamp them with the join or the
+        // return, and say so in the jsonl.
+        let caughtUp = catchingUp
+        catchingUp = false
         if !kept.isEmpty {
-            status("recovered \(kept.count) caption line(s) spoken before joining")
+            status(caughtUp
+                ? "recovered \(kept.count) caption line(s) spoken while the call window was out of view"
+                : "recovered \(kept.count) caption line(s) spoken before joining")
         }
-        // Spoken before we joined, at times the panel does not show: stamp
-        // them with the join, and say so in the jsonl.
+        let stamp = caughtUp ? clock.now() : timelineStart
+        let extra: [String: Any] = caughtUp ? ["history": true, "caught_up": true] : ["history": true]
         for line in kept {
-            emit(kind: "caption", speaker: line.speaker, body: line.text,
-                 at: timelineStart, extra: ["history": true])
+            emit(kind: "caption", speaker: line.speaker, body: line.text, at: stamp, extra: extra)
         }
         let held = heldCaptions
         heldCaptions = []
@@ -5498,6 +5662,36 @@ final class Session {
     /// If not, the app accepted the press and ignored it (Meet did, twice, at
     /// the start of a call on 2026-10-22), so say so and press again later.
     /// Internal so tests can drive it with a scripted app.
+    /// The meeting window is out of view (another Space, minimised): nothing
+    /// can be read until it is back, but the meeting goes on.
+    private(set) var outOfView = false
+    /// The history read under way is a catch-up after the window came back.
+    private var catchingUp = false
+
+    func wentOutOfView() {
+        guard !outOfView else { return }
+        outOfView = true
+        if !options.quiet {
+            status("\(meetingApp.displayName) call window is out of view (full screen on another Space, or minimised); pausing until it is back")
+        }
+    }
+
+    /// Back in view: read what was said meanwhile from the app's own
+    /// transcript, holding live captions until it is in, as at join.
+    func backInView() {
+        guard outOfView else { return }
+        outOfView = false
+        captionsContainer = nil
+        if !options.quiet {
+            status("\(meetingApp.displayName) call window is back; catching up on what was said meanwhile")
+        }
+        guard options.captureCaptions, !historyPending else { return }
+        meetingApp.beginCaptionCatchUp()
+        catchingUp = true
+        historyPending = true
+        historyDeadline = clock.now().addingTimeInterval(Session.historyBudgetSeconds)
+    }
+
     /// The meeting was left and rejoined within one session: captions seen
     /// before prove nothing about now, so check them again from scratch.
     func meetingRejoined() {
@@ -6971,10 +7165,13 @@ while !stopRequested {
                     }
                 }
             } else if let anchor = current.meetingApp.meetingAnchor(current.element) {
-                // Back after an absence as a different element: the meeting
-                // was left and rejoined faster than the debounce below, and
-                // the app may have reset its captions meanwhile (Slack does).
-                if leaveMissingSince != nil, let previous = lastAnchor, !CFEqual(previous, anchor) {
+                if session?.outOfView == true {
+                    session?.backInView()
+                } else if leaveMissingSince != nil, let previous = lastAnchor, !CFEqual(previous, anchor) {
+                    // Back after an absence as a different element: the
+                    // meeting was left and rejoined faster than the debounce
+                    // below, and the app may have reset its captions
+                    // meanwhile (Slack does).
                     session?.meetingRejoined()
                 }
                 lastAnchor = anchor
@@ -6986,7 +7183,14 @@ while !stopRequested {
                 let missingSince = leaveMissingSince ?? now
                 leaveMissingSince = missingSince
                 if now.timeIntervalSince(missingSince) > 10 {
-                    endSession("left \"\(session?.title ?? "")\"")
+                    // A window that still exists out of view is a meeting
+                    // still going on; only its closing ends the session.
+                    if let active = session,
+                       current.meetingApp.meetingOutOfView(pid: current.pid, title: active.title) {
+                        active.wentOutOfView()
+                    } else {
+                        endSession("left \"\(session?.title ?? "")\"")
+                    }
                 }
             }
         }

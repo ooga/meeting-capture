@@ -1441,10 +1441,37 @@ do {
     expectTrue(slackPanelRow(["Cédric Laverdure", "joined the huddle."]) == nil, "a join in the Captions panel is not speech")
     expectTrue(slackPanelRow(["Julien MAZARS", "reacted "]) == nil, "nor is a reaction")
     expectEqual(slackPanelRow(["Johan Rouve", "Mhm mhm"]), SegmentKey(speaker: "Johan Rouve", text: "Mhm mhm"), "speech is kept")
+    do {
+        let k = { (speaker: String, text: String) in SegmentKey(speaker: speaker, text: text) }
+        let panel = [k("A", "Bonjour à tous."), k("B", "Ouais."), k("A", "On commence par le point produit."),
+                     k("B", "Ouais."), k("C", "Dit pendant l'absence."), k("A", "Et ça aussi.")]
+        expectEqual(slackRowsAfter(panel, recorded: [k("A", "On commence par le point produit."), k("B", "Ouais.")]),
+                    [k("C", "Dit pendant l'absence."), k("A", "Et ça aussi.")],
+                    "catch-up: anchors on the longest recent line, skips the short one recorded after it")
+        expectEqual(slackRowsAfter([k("A", "Bonjour à tous. On commence."), k("C", "Après.")],
+                                   recorded: [k("A", "Bonjour à tous.")]),
+                    [k("C", "Après.")], "catch-up: a recorded line merged into a longer panel row still anchors")
+        expectTrue(slackRowsAfter(panel, recorded: [k("Z", "Jamais dit.")]) == nil,
+                   "catch-up: nothing recorded found in the panel means nothing to recover")
+        expectEqual(slackRowsAfter(panel, recorded: [k("A", "Et ça aussi.")]), [], "catch-up: nothing missed")
+    }
+    expectTrue(slackHuddleOutOfView(windows: [("tech_mm (canal) - DT - Slack [principal]", true), ("tech_mm - DT - Slack", false)],
+                                     title: "tech_mm"), "the full-screen huddle window on another Space is out of view")
+    expectTrue(slackHuddleOutOfView(windows: [("tech_mm (canal) - DT - Slack [principal]", true), ("tech_mm - DT - Slack", true)],
+                                    title: "tech_mm"), "coming back to the Space: on screen before the tree has it, still the huddle")
+    expectTrue(!slackHuddleOutOfView(windows: [("tech_mm (canal) - DT - Slack [principal]", true)], title: "tech_mm"),
+               "no huddle window left: the huddle is over")
+    expectTrue(!slackHuddleOutOfView(windows: [("", false), ("", true)], title: "tech_mm"),
+               "window names unreadable (no Screen Recording permission): not assumed out of view")
+    expectTrue(!slackHuddleOutOfView(windows: [("other - DT - Slack", false)], title: "tech_mm"),
+               "another hidden Slack window is not this huddle")
     expectTrue(isSlackCaptionsMenuItem("Afficher les sous-titres"), "French ⋮ menu captions entry")
     expectTrue(isSlackCaptionsMenuItem("Show captions"), "English ⋮ menu captions entry")
     expectTrue(!isSlackCaptionsMenuItem("Langue de l’appel d’équipe"), "the language submenu is not the captions one")
     expectTrue(isSlackLeaveButton(description: "Leave Huddle", classes: []), "English Leave button")
+    expectTrue(!isSlackLeaveButton(description: "Quitter l’appel d’équipe",
+                                    classes: ["c-button-unstyled", "p-huddle_channel_header_button__leave_button"]),
+               "the main window's channel-header Leave button is not the huddle window's")
     expectTrue(isSlackLeaveButton(description: "Quitter l’appel d’équipe", classes: []), "French Leave button, typographic apostrophes")
     expectTrue(isSlackLeaveButton(description: "", classes: ["c-button-unstyled", "leaveButton__wzISw"]), "Leave button by its class, any language")
     expectTrue(!isSlackLeaveButton(description: "Quitter", classes: ["c-button"]), "another button is not the Leave button")
