@@ -1580,6 +1580,11 @@ protocol MeetingApp {
     /// of ending. `title` is the session's meeting title.
     func meetingOutOfView(pid: pid_t, title: String) -> Bool
 
+    /// True while the meeting window the tree can still see is minimised.
+    /// It keeps its Leave button, so the meeting looks up, but its captions
+    /// stop updating until it is restored.
+    func meetingMinimized(_ app: AXUIElement) -> Bool
+
     /// The meeting window is back in view: the next history read is a
     /// catch-up, returning only what was said while it was out of view.
     func beginCaptionCatchUp()
@@ -1690,6 +1695,7 @@ extension MeetingApp {
     func captionHistoryStep(_ app: AXUIElement) -> [SegmentKey]? { [] }
     func captionHistoryWaiting(_ app: AXUIElement) -> Bool { false }
     func meetingOutOfView(pid: pid_t, title: String) -> Bool { false }
+    func meetingMinimized(_ app: AXUIElement) -> Bool { false }
     func beginCaptionCatchUp() {}
     // Only Teams parks a covered window; everyone else keeps rendering.
     func maintainSurfaces(_ app: AXUIElement, pid: pid_t, now: Date,
@@ -3258,6 +3264,22 @@ func isSlackPanelNotice(_ text: String) -> Bool {
 /// Consecutive pages overlap; a page wholly inside what is already held adds
 /// nothing. Pages that do not overlap at all are appended (a jump too far
 /// for the overscan), which can only lose order, never words.
+/// Stitch pages whose rows carry the virtual list's own row number, as
+/// Slack's do (AXDOMIdentifier "282", "283", …). The number says where a row
+/// belongs, so a row read twice is kept once, in its latest wording: the
+/// newest rows grow while the list is read, and stitching by text appended
+/// every page again (2026-11-26: 303 rows read, 78 distinct). Falls back to
+/// stitching by text when any row has no number.
+func mergeNumberedCaptionPages(_ pages: [[(index: Int?, key: SegmentKey)]]) -> [SegmentKey] {
+    let rows = pages.joined()
+    guard rows.allSatisfy({ $0.index != nil }) else {
+        return mergeCaptionPages(pages.map { $0.map(\.key) })
+    }
+    var byIndex: [Int: SegmentKey] = [:]
+    for row in rows { byIndex[row.index!] = row.key }
+    return byIndex.keys.sorted().map { byIndex[$0]! }
+}
+
 func mergeCaptionPages(_ pages: [[SegmentKey]]) -> [SegmentKey] {
     var merged: [SegmentKey] = []
     for page in pages where !page.isEmpty {
@@ -3643,10 +3665,10 @@ final class SlackApp: MeetingApp {
 
     private enum HistoryPhase { case toTop, collect }
     private var historyPhase = HistoryPhase.toTop
-    private var historyPages: [[SegmentKey]] = []
+    private var historyPages: [[(index: Int?, key: SegmentKey)]] = []
     /// Polls in a row on which the list did not move; three means an end.
     private var historyStill = 0
-    private var historyMarker: SegmentKey?
+    private var historyMarker: String?
     private var historyPressedTab = false
     private var historyLocateTries = 0
     private let virtualListClass = "c-virtual_list__scroll_container"
@@ -3683,6 +3705,14 @@ final class SlackApp: MeetingApp {
              onScreen: ($0[kCGWindowIsOnscreen as String] as? Bool) ?? false)
         }
         return slackHuddleOutOfView(windows: windows, title: title)
+    }
+
+    /// A minimised huddle window stays in the tree with its Leave button,
+    /// but its captions freeze: on 2026-11-26 the overlay went silent for
+    /// the 86 seconds the window sat in the Dock.
+    func meetingMinimized(_ app: AXUIElement) -> Bool {
+        guard let window = huddleWindow(app) else { return false }
+        return (axAttribute(window, kAXMinimizedAttribute) as? NSNumber)?.boolValue == true
     }
 
     func beginCaptionCatchUp() {
@@ -3728,7 +3758,7 @@ final class SlackApp: MeetingApp {
         let rows = panelRows(list)
         switch historyPhase {
         case .toTop:
-            if settled(on: rows.first?.key) || rows.isEmpty {
+            if settled(on: rows.first.map(edgeMarker)) || rows.isEmpty {
                 historyPhase = .collect
                 historyStill = 0
                 historyMarker = nil
@@ -3737,9 +3767,9 @@ final class SlackApp: MeetingApp {
             scroll(toward: rows.first?.element, in: list, up: true)
             return nil
         case .collect:
-            historyPages.append(rows.map(\.key))
-            if settled(on: rows.last?.key) || rows.isEmpty {
-                var merged = mergeCaptionPages(historyPages)
+            historyPages.append(rows.map { (index: $0.index, key: $0.key) })
+            if settled(on: rows.last.map(edgeMarker)) || rows.isEmpty {
+                var merged = mergeNumberedCaptionPages(historyPages)
                 status("Slack caption history: read \(merged.count) row(s) over \(historyPages.count) page(s)")
                 if catchingUp {
                     catchingUp = false
@@ -3764,8 +3794,14 @@ final class SlackApp: MeetingApp {
         }
     }
 
+    /// The edge row by its list number, so a last row still growing as
+    /// someone speaks does not keep the read from ever settling.
+    private func edgeMarker(_ row: (element: AXUIElement, key: SegmentKey, index: Int?)) -> String {
+        row.index.map(String.init) ?? "\(row.key.speaker)\u{1F}\(row.key.text)"
+    }
+
     /// True once the list's edge row has held still for three polls.
-    private func settled(on edge: SegmentKey?) -> Bool {
+    private func settled(on edge: String?) -> Bool {
         if edge == historyMarker { historyStill += 1 } else { historyStill = 0; historyMarker = edge }
         return historyStill >= 3
     }
@@ -3792,7 +3828,7 @@ final class SlackApp: MeetingApp {
         return nil
     }
 
-    private func panelRows(_ list: AXUIElement) -> [(element: AXUIElement, key: SegmentKey)] {
+    private func panelRows(_ list: AXUIElement) -> [(element: AXUIElement, key: SegmentKey, index: Int?)] {
         var items: [AXUIElement] = []
         func collect(_ element: AXUIElement, depth: Int) {
             guard depth < 12 else { return }
@@ -3804,7 +3840,9 @@ final class SlackApp: MeetingApp {
         }
         collect(list, depth: 0)
         if items.isEmpty { items = axChildren(list) }
-        return items.compactMap { item in slackPanelRow(axStaticTexts(item)).map { (item, $0) } }
+        return items.compactMap { item in
+            slackPanelRow(axStaticTexts(item)).map { (item, $0, Int(axDomID(item))) }
+        }
     }
 
     /// Bring the edge row into view, which makes the virtual list render the
@@ -7165,7 +7203,9 @@ while !stopRequested {
                     }
                 }
             } else if let anchor = current.meetingApp.meetingAnchor(current.element) {
-                if session?.outOfView == true {
+                if let active = session, current.meetingApp.meetingMinimized(current.element) {
+                    active.wentOutOfView()
+                } else if session?.outOfView == true {
                     session?.backInView()
                 } else if leaveMissingSince != nil, let previous = lastAnchor, !CFEqual(previous, anchor) {
                     // Back after an absence as a different element: the

@@ -1505,6 +1505,14 @@ do {
     expectEqual(mergeCaptionPages([[a, k("E", "Yeah.")], [k("E", "Yeah."), c, k("E", "Yeah.")]]),
                 [a, k("E", "Yeah."), c, k("E", "Yeah.")],
                 "a repeated short line survives stitching")
+    let grown = k("T", "three and more")
+    expectEqual(mergeNumberedCaptionPages([[(1, a), (2, b), (3, c)], [(2, b), (3, grown), (4, d)],
+                                           [(3, grown), (4, d), (5, e)], [(3, grown), (4, d), (5, e)]]),
+                [a, b, grown, d, e], "numbered rows read again while growing are kept once, latest wording")
+    expectEqual(mergeNumberedCaptionPages([[(2, b), (3, c)], [(1, a), (2, b)]]), [a, b, c],
+                "numbered rows sort by their number")
+    expectEqual(mergeNumberedCaptionPages([[(nil, a), (nil, b)], [(nil, b), (nil, c)]]), [a, b, c],
+                "rows without numbers stitch by text")
 
     let said = k("T", "I think it's this clustering, yeah, so.")
     expectEqual(trimCaptionHistory([a, b, said], against: [said]), [a, b],
